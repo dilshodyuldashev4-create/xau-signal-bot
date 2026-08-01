@@ -21,6 +21,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import yt_dlp
 import asyncpg
@@ -118,40 +119,150 @@ def is_admin(user_id: int) -> bool:
 # База подписчиков PostgreSQL (Railway)
 # ---------------------------------------------------------------------------
 
-DATABASE_URL = os.getenv("DATABASE_URL")
 db_pool: asyncpg.Pool | None = None
 
 
-async def init_db() -> None:
-    """Подключается к PostgreSQL и создаёт таблицу подписчиков."""
-    global db_pool
+def _clean_env(name: str) -> str:
+    """Возвращает значение переменной Railway без кавычек и пробелов."""
+    value = (os.getenv(name) or "").strip()
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in {"'", '"'}
+    ):
+        value = value[1:-1].strip()
+    return value
 
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "Переменная DATABASE_URL не найдена. "
-            "Добавьте PostgreSQL в проект Railway."
+
+def build_database_url() -> str:
+    """
+    Получает корректный PostgreSQL URL.
+
+    Порядок:
+    1. DATABASE_URL;
+    2. DATABASE_PRIVATE_URL;
+    3. DATABASE_PUBLIC_URL;
+    4. сборка адреса из PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE.
+    """
+    for variable_name in (
+        "DATABASE_URL",
+        "DATABASE_PRIVATE_URL",
+        "DATABASE_PUBLIC_URL",
+    ):
+        raw_url = _clean_env(variable_name)
+        if not raw_url:
+            continue
+
+        # Неразрешённая ссылка Railway не является настоящим URL.
+        if raw_url.startswith("${{") and raw_url.endswith("}}"):
+            log.warning("%s содержит неразрешённую Railway-ссылку.", variable_name)
+            continue
+
+        # Railway иногда показывает postgres://, asyncpg понимает оба варианта,
+        # но приводим к одному стандартному виду.
+        if raw_url.startswith("postgres://"):
+            raw_url = "postgresql://" + raw_url[len("postgres://"):]
+
+        try:
+            parsed = urlsplit(raw_url)
+            if parsed.scheme not in {"postgresql", "postgres"}:
+                raise ValueError("неверная схема")
+            if not parsed.hostname:
+                raise ValueError("не указан сервер")
+            if parsed.port is None:
+                raise ValueError("не указан числовой порт")
+
+            # Пересобираем URL, чтобы убрать случайные пробелы и мусор.
+            return urlunsplit(
+                (
+                    "postgresql",
+                    parsed.netloc,
+                    parsed.path or "/railway",
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        except (ValueError, TypeError) as error:
+            log.error("%s имеет неправильный формат: %s", variable_name, error)
+
+    host = _clean_env("PGHOST")
+    port = _clean_env("PGPORT")
+    user = _clean_env("PGUSER")
+    password = _clean_env("PGPASSWORD")
+    database = _clean_env("PGDATABASE")
+
+    if host and port and user and database:
+        if not port.isdigit():
+            raise RuntimeError(
+                f"PGPORT должен быть числом, но сейчас указано: {port!r}"
+            )
+
+        auth = quote(user, safe="")
+        if password:
+            auth += ":" + quote(password, safe="")
+
+        return (
+            f"postgresql://{auth}@{host}:{port}/"
+            f"{quote(database, safe='')}"
         )
 
-    db_pool = await asyncpg.create_pool(
-        dsn=DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        command_timeout=30,
+    raise RuntimeError(
+        "Не найдены корректные данные PostgreSQL. В worker добавьте Reference: "
+        "Postgres → DATABASE_URL. Не вставляйте адрес вручную."
     )
 
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subscribers (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+async def init_db() -> None:
+    """Подключается к PostgreSQL с повторными попытками и создаёт таблицу."""
+    global db_pool
+
+    database_url = build_database_url()
+    last_error: Exception | None = None
+
+    for attempt in range(1, 6):
+        try:
+            db_pool = await asyncpg.create_pool(
+                dsn=database_url,
+                min_size=1,
+                max_size=5,
+                timeout=15,
+                command_timeout=30,
+                server_settings={"application_name": "tg_media_bot"},
             )
-            """
-        )
+
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subscribers (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+            log.info("PostgreSQL подключён, таблица subscribers готова.")
+            return
+        except Exception as error:
+            last_error = error
+            log.error(
+                "Не удалось подключиться к PostgreSQL, попытка %s/5: %s",
+                attempt,
+                error,
+            )
+            if db_pool is not None:
+                await db_pool.close()
+                db_pool = None
+            if attempt < 5:
+                await asyncio.sleep(attempt * 2)
+
+    raise RuntimeError(
+        "После 5 попыток PostgreSQL недоступен. "
+        "Проверьте Reference Postgres → DATABASE_URL в worker."
+    ) from last_error
 
 
 async def close_db() -> None:
@@ -163,7 +274,7 @@ async def close_db() -> None:
 
 def require_db() -> asyncpg.Pool:
     if db_pool is None:
-        raise RuntimeError("База данных ещё не подключена.")
+        raise RuntimeError("PostgreSQL ещё не подключён.")
     return db_pool
 
 
@@ -238,7 +349,11 @@ class SaveSubscriberMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data):
         user: User | None = data.get("event_from_user")
         if user and not user.is_bot:
-            await save_subscriber(user.id, user.username, user.first_name)
+            try:
+                await save_subscriber(user.id, user.username, user.first_name)
+            except Exception:
+                # Ошибка сохранения подписчика не должна ломать ответы бота.
+                log.exception("Не удалось сохранить подписчика %s", user.id)
         return await handler(event, data)
 
 
@@ -623,7 +738,6 @@ async def global_error_handler(event):
 async def main():
     log.info("Запуск бота...")
     await init_db()
-    log.info("PostgreSQL подключён, таблица подписчиков готова.")
 
     try:
         # На случай, если Railway не убил старый инстанс сразу при редеплое —

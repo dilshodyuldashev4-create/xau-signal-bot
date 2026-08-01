@@ -17,13 +17,13 @@ Telegram-бот: скачивание видео с любых платформ 
 import asyncio
 import logging
 import os
+import sqlite3
 import sys
 import tempfile
 import uuid
 from pathlib import Path
 
 import yt_dlp
-import asyncpg
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -83,6 +83,12 @@ if not ADMIN_IDS:
 
 MAX_TELEGRAM_FILE_MB = 50  # ограничение обычного бота на отправку файлов
 
+# Путь к базе подписчиков. На Railway контейнер эфемерный: без подключённого
+# Volume файл пропадёт при следующем деплое/рестарте. Чтобы база переживала
+# рестарты — создай Volume (Settings -> Volumes) и примонтируй его, например,
+# на /data, а затем поставь переменную DB_PATH=/data/subscribers.db
+DB_PATH = os.getenv("DB_PATH", "subscribers.db")
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -115,120 +121,50 @@ def is_admin(user_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# База подписчиков PostgreSQL (Railway)
+# База подписчиков (SQLite)
 # ---------------------------------------------------------------------------
 
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
-db_pool: asyncpg.Pool | None = None
-
-
-async def init_db() -> None:
-    """Подключается напрямую к DATABASE_URL и создаёт таблицу подписчиков."""
-    global db_pool
-
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL не найден. Добавьте в worker Reference: "
-            "Postgres → DATABASE_URL."
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscribers (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            first_seen TEXT DEFAULT (datetime('now'))
         )
-
-    db_pool = await asyncpg.create_pool(
-        dsn=DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        command_timeout=30,
-    )
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subscribers (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-
-    log.info("PostgreSQL подключён, таблица subscribers готова.")
-
-
-async def close_db() -> None:
-    global db_pool
-    if db_pool is not None:
-        await db_pool.close()
-        db_pool = None
-
-
-def require_db() -> asyncpg.Pool:
-    if db_pool is None:
-        raise RuntimeError("PostgreSQL ещё не подключён.")
-    return db_pool
-
-
-async def save_subscriber(
-    user_id: int,
-    username: str | None,
-    first_name: str | None,
-) -> None:
-    pool = require_db()
-    await pool.execute(
-        """
-        INSERT INTO subscribers (
-            user_id,
-            username,
-            first_name,
-            is_active,
-            updated_at
-        )
-        VALUES ($1, $2, $3, TRUE, NOW())
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-            username = EXCLUDED.username,
-            first_name = EXCLUDED.first_name,
-            is_active = TRUE,
-            updated_at = NOW()
-        """,
-        user_id,
-        username or "",
-        first_name or "",
-    )
-
-
-async def deactivate_subscriber(user_id: int) -> None:
-    pool = require_db()
-    await pool.execute(
-        """
-        UPDATE subscribers
-        SET is_active = FALSE, updated_at = NOW()
-        WHERE user_id = $1
-        """,
-        user_id,
-    )
-
-
-async def get_all_subscriber_ids() -> list[int]:
-    pool = require_db()
-    rows = await pool.fetch(
-        """
-        SELECT user_id
-        FROM subscribers
-        WHERE is_active = TRUE
-        ORDER BY first_seen ASC
         """
     )
-    return [int(row["user_id"]) for row in rows]
+    conn.commit()
+    conn.close()
 
 
-async def count_subscribers() -> int:
-    pool = require_db()
-    count = await pool.fetchval(
-        "SELECT COUNT(*) FROM subscribers WHERE is_active = TRUE"
+def save_subscriber(user_id: int, username: str | None, first_name: str | None):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO subscribers (user_id, username, first_name) VALUES (?, ?, ?)",
+        (user_id, username or "", first_name or ""),
     )
-    return int(count or 0)
+    conn.commit()
+    conn.close()
+
+
+def get_all_subscriber_ids() -> list[int]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT user_id FROM subscribers").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def count_subscribers() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    n = conn.execute("SELECT COUNT(*) FROM subscribers").fetchone()[0]
+    conn.close()
+    return n
+
+
+init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -240,10 +176,7 @@ class SaveSubscriberMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data):
         user: User | None = data.get("event_from_user")
         if user and not user.is_bot:
-            try:
-                await save_subscriber(user.id, user.username, user.first_name)
-            except Exception:
-                log.exception("Не удалось сохранить подписчика %s", user.id)
+            save_subscriber(user.id, user.username, user.first_name)
         return await handler(event, data)
 
 
@@ -298,7 +231,7 @@ async def admin_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    n = await count_subscribers()
+    n = count_subscribers()
     await callback.message.answer(f"📊 Подписчиков в базе: <b>{n}</b>")
     await callback.answer()
 
@@ -330,7 +263,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    subscriber_ids = await get_all_subscriber_ids()
+    subscriber_ids = get_all_subscriber_ids()
     status = await message.answer(
         f"⏳ Начинаю рассылку на {len(subscriber_ids)} подписчиков..."
     )
@@ -347,7 +280,6 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
             sent += 1
         except Exception as e:
             failed += 1
-            await deactivate_subscriber(uid)
             log.warning("Не удалось отправить рассылку %s: %s", uid, e)
         # небольшая пауза, чтобы не упереться в лимиты Telegram (~30 сообщений/сек)
         await asyncio.sleep(0.05)
@@ -627,17 +559,11 @@ async def global_error_handler(event):
 
 async def main():
     log.info("Запуск бота...")
-    await init_db()
-    log.info("PostgreSQL подключён, таблица подписчиков готова.")
-
-    try:
-        # На случай, если Railway не убил старый инстанс сразу при редеплое —
-        # сбрасываем возможный webhook перед стартом polling.
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
-    finally:
-        await close_db()
-        await bot.session.close()
+    # На случай, если Railway не убил старый инстанс сразу при редеплое —
+    # сбрасываем возможный "зависший" webhook/сессию перед стартом polling,
+    # чтобы не поймать ошибку Conflict: terminated by other getUpdates request.
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
